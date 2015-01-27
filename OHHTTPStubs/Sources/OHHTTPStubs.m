@@ -30,11 +30,14 @@
 #pragma mark - Imports
 
 #import "OHHTTPStubs.h"
+#import <objc/runtime.h>
 
 ////////////////////////////////////////////////////////////////////////////////
 #pragma mark - Types & Constants
 
-@interface OHHTTPStubsProtocol : NSURLProtocol @end
+@interface OHHTTPStubsProtocol : NSURLProtocol
++(Class)OH_subclassForSessionConfig:(NSURLSessionConfiguration*)sessionConfig;
+@end
 
 static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chunk of the data from the stream each 'slotTime' seconds
 
@@ -171,7 +174,7 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
         && [sessionConfig respondsToSelector:@selector(setProtocolClasses:)])
     {
         NSMutableArray * urlProtocolClasses = [NSMutableArray arrayWithArray:sessionConfig.protocolClasses];
-        Class protoCls = OHHTTPStubsProtocol.class;
+        Class protoCls = [OHHTTPStubsProtocol OH_subclassForSessionConfig:sessionConfig];
         if (enable && ![urlProtocolClasses containsObject:protoCls])
         {
             [urlProtocolClasses insertObject:protoCls atIndex:0];
@@ -179,6 +182,7 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
         else if (!enable && [urlProtocolClasses containsObject:protoCls])
         {
             [urlProtocolClasses removeObject:protoCls];
+            // FIXME: I should also objc_disposeClassPair() probably
         }
         sessionConfig.protocolClasses = urlProtocolClasses;
     }
@@ -275,9 +279,59 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
 
 @implementation OHHTTPStubsProtocol
 
+#if defined(__IPHONE_7_0) || defined(__MAC_10_9)
+
+static void* OHHTTPSTUBS_SESSIONCONFIGURATION_KEY = &OHHTTPSTUBS_SESSIONCONFIGURATION_KEY;
++ (Class)OH_subclassForSessionConfig:(NSURLSessionConfiguration*)sessionConfig
+{
+    NSString* className = [NSString stringWithFormat:@"%@_%lld", [self class], (long long)sessionConfig];
+    Class subclass = objc_getClass([className UTF8String]);
+    if (!subclass)
+    {
+        subclass = objc_allocateClassPair(self.class, [className UTF8String], 0);
+        objc_registerClassPair(subclass);
+        objc_setAssociatedObject(subclass, OHHTTPSTUBS_SESSIONCONFIGURATION_KEY, sessionConfig, OBJC_ASSOCIATION_RETAIN);
+    }
+    return subclass;
+}
+
++ (NSURLSessionConfiguration*)OH_sessionConfiguration
+{
+    return objc_getAssociatedObject(self.class, OHHTTPSTUBS_SESSIONCONFIGURATION_KEY);
+}
+
++ (NSURLRequest*)OH_enrichedRequestForRequest:(NSURLRequest*)request
+{
+    static NSString* const kEnrichedKey = @"OHHTTPStubs-Enriched-Request";
+    if ([self propertyForKey:kEnrichedKey inRequest:request] != nil) return request;
+    
+    NSURLRequest* newRequest = request;
+    NSURLSessionConfiguration* config = [self.class OH_sessionConfiguration];
+    if (config && config.HTTPAdditionalHeaders)
+    {
+        NSMutableURLRequest* mutRequest = [request mutableCopy];
+        [config.HTTPAdditionalHeaders enumerateKeysAndObjectsUsingBlock:^(NSString* header, id value, BOOL *stop) {
+            [mutRequest addValue:value forHTTPHeaderField:header];
+        }];
+        [self setProperty:@YES forKey:kEnrichedKey inRequest:mutRequest];
+        newRequest = [mutRequest copy];
+    }
+    return newRequest;
+}
+
+#else
+
++ (NSURLRequest*)OH_enrichedRequestForRequest:(NSURLRequest*)request
+{
+    return request;
+}
+
+#endif
+
 + (BOOL)canInitWithRequest:(NSURLRequest *)request
 {
-    return ([OHHTTPStubs.sharedInstance firstStubPassingTestForRequest:request] != nil);
+    NSURLRequest* enrichedRequest = [self OH_enrichedRequestForRequest:request];
+    return ([OHHTTPStubs.sharedInstance firstStubPassingTestForRequest:enrichedRequest] != nil);
 }
 
 + (BOOL)canInitWithTask:(NSURLSessionTask *)task
@@ -289,8 +343,9 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
 - (id)initWithRequest:(NSURLRequest *)request cachedResponse:(NSCachedURLResponse *)response client:(id<NSURLProtocolClient>)client
 {
     // Make super sure that we never use a cached response.
-    OHHTTPStubsProtocol* proto = [super initWithRequest:request cachedResponse:nil client:client];
-    proto.stub = [OHHTTPStubs.sharedInstance firstStubPassingTestForRequest:request];
+    NSURLRequest* enrichedRequest = [self.class OH_enrichedRequestForRequest:request];
+    OHHTTPStubsProtocol* proto = [super initWithRequest:enrichedRequest cachedResponse:nil client:client];
+    proto.stub = [OHHTTPStubs.sharedInstance firstStubPassingTestForRequest:enrichedRequest];
     return proto;
 }
 
