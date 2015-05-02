@@ -77,20 +77,26 @@
     NSURLProtocolClientProxy* clientProxy = [[NSURLProtocolClientProxy alloc] initWithMethodInvocationHandler:^(NSInvocation *invocation) {
         NSString* methodName = NSStringFromSelector(invocation.selector);
         NSLog(@"Invoked method %@ on NSURLProtocolClient", methodName);
-        XCTAssertEqualObjects(_callingThread, [NSThread currentThread], @"Method %@ not call on the calling thread!", methodName);
+        XCTAssertEqualObjects(_callingThread, [NSThread currentThread], @"Method %@ not called on the calling thread!", methodName);
     }];
     Class stubsProtocolClass = NSClassFromString(@"OHHTTPStubsProtocol");
     [clientProxy installAsMockForClass:stubsProtocolClass];
     
-
-    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
-    [queue addOperationWithBlock:^{
+    XCTestExpectation* expectation = [self expectationWithDescription:@"Request Completed"];
+    [[[NSOperationQueue alloc] init] addOperationWithBlock:^{
         _callingThread = [NSThread currentThread];
         NSAssert(_callingThread != [NSThread mainThread], @"Test is not working as designed. It should call the request from a thread other than the main");
         NSURLRequest* req = [NSURLRequest requestWithURL:testURL];
-        [NSURLConnection sendSynchronousRequest:req returningResponse:nil error:nil];
+        [NSURLConnection sendAsynchronousRequest:req queue:[NSOperationQueue mainQueue]
+                               completionHandler:^(NSURLResponse *response, NSData *data, NSError *connectionError)
+        {
+            [expectation fulfill];
+        }];
+        
+        CFRunLoopRun();
     }];
-    [queue waitUntilAllOperationsAreFinished];
+    
+    [self waitForExpectationsWithTimeout:1.0 handler:nil];
 
     [clientProxy uninstallAsMockForClass:stubsProtocolClass];
 }
