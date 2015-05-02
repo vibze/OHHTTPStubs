@@ -25,6 +25,7 @@
 
 #import <XCTest/XCTest.h>
 #import "OHHTTPStubs.h"
+#import <objc/runtime.h>
 
 @interface ThreadingTests : XCTestCase
 {
@@ -33,7 +34,14 @@
 }
 @end
 
-static NSTimeInterval kResponseTimeTolerence = 0.5f;
+@interface NSURLProtocolClientProxy : NSObject
+-(instancetype)initWithMethodInvocationHandler:(void(^)(NSInvocation*))block;
+-(void)installAsMockForClass:(Class)cls;
+-(void)uninstallAsMockForClass:(Class)cls;
+@end
+
+
+
 
 @implementation ThreadingTests
 
@@ -42,6 +50,8 @@ static NSTimeInterval kResponseTimeTolerence = 0.5f;
     [super setUp];
     [OHHTTPStubs removeAllStubs];
 }
+
+///////////////////////////////////////////////////////////////////////////////////////
 
 /*
  According to
@@ -64,48 +74,106 @@ static NSTimeInterval kResponseTimeTolerence = 0.5f;
                                              headers:nil];
     }];
     
-    _connectionFinishedExpectation = [self expectationWithDescription:@"NSURLConnection did finish (with error or success)"];
-    __block NSURLConnection* _connection;
-
-    NSOperationQueue* q = [[NSOperationQueue alloc] init];
-    [q addOperationWithBlock:^{
-        _callingThread = [NSThread currentThread];
-        XCTAssertNotEqual(_callingThread, [NSThread mainThread], @"Test is not working as designed. It should call the request from a thread other than the main");
-        NSURLRequest* req = [NSURLRequest requestWithURL:testURL];
-        _connection = [NSURLConnection connectionWithRequest:req delegate:self];
-
-        CFRunLoopRun(); // For the thread's runloop to run, so that the NSURLConnection request is executed.
+    NSURLProtocolClientProxy* clientProxy = [[NSURLProtocolClientProxy alloc] initWithMethodInvocationHandler:^(NSInvocation *invocation) {
+        NSString* methodName = NSStringFromSelector(invocation.selector);
+        NSLog(@"Invoked method %@ on NSURLProtocolClient", methodName);
+        XCTAssertEqualObjects(_callingThread, [NSThread currentThread], @"Method %@ not call on the calling thread!", methodName);
     }];
-
-    [self waitForExpectationsWithTimeout:kResponseTimeTolerence handler:nil];
+    Class stubsProtocolClass = NSClassFromString(@"OHHTTPStubsProtocol");
+    [clientProxy installAsMockForClass:stubsProtocolClass];
     
-    // in case we timed out before the end of the request (test failed), cancel the request to avoid further delegate method calls
-    [_connection cancel];
+
+    NSOperationQueue* queue = [[NSOperationQueue alloc] init];
+    [queue addOperationWithBlock:^{
+        _callingThread = [NSThread currentThread];
+        NSAssert(_callingThread != [NSThread mainThread], @"Test is not working as designed. It should call the request from a thread other than the main");
+        NSURLRequest* req = [NSURLRequest requestWithURL:testURL];
+        [NSURLConnection sendSynchronousRequest:req returningResponse:nil error:nil];
+    }];
+    [queue waitUntilAllOperationsAreFinished];
+
+    [clientProxy uninstallAsMockForClass:stubsProtocolClass];
 }
+
+
+@end
+
+
+
+
 
 ///////////////////////////////////////////////////////////////////////////////////////
+// MARK: Mocking
+
+/**
+ * NOTE: We could probably have used something like OCMock here, but I was not sure that
+ *       I wanted to import a whole mocking framework like this *just* for one Unit Test.
+ *
+ *       If we need more mocking in future tests, one may reconsider importing it in the future.
+ */
 
 
--(void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response
+@implementation NSURLProtocolClientProxy
 {
-    XCTAssertEqual(_callingThread, [NSThread currentThread], @"%@ not called on the calling thread", NSStringFromSelector(_cmd));
+    void(^ _invocationBlock)(NSInvocation*);
+    id<NSURLProtocolClient> _realClient;
+    id<NSURLProtocolClient>(*_originalClientImplementation)(id, SEL);
 }
 
--(void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data
+-(instancetype)initWithMethodInvocationHandler:(void(^)(NSInvocation*))block;
 {
-    XCTAssertEqual(_callingThread, [NSThread currentThread], @"%@ not called on the calling thread", NSStringFromSelector(_cmd));
+    self = [super init];
+    _invocationBlock = block;
+    return self;
+}
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)selector
+{
+    NSMethodSignature* signature = [super methodSignatureForSelector:selector];
+    if (!signature) {
+        signature = [(NSObject*)_realClient methodSignatureForSelector:selector];
+    }
+    return signature;
 }
 
--(void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error
+- (void)forwardInvocation:(NSInvocation *)anInvocation
 {
-    XCTAssertEqual(_callingThread, [NSThread currentThread], @"%@ not called on the calling thread", NSStringFromSelector(_cmd));
-    [_connectionFinishedExpectation fulfill];
+    if ([_realClient respondsToSelector:[anInvocation selector]]) {
+        if (_invocationBlock) _invocationBlock(anInvocation);
+        [anInvocation invokeWithTarget:_realClient];
+    } else {
+        [super forwardInvocation:anInvocation];
+    }
 }
 
--(void)connectionDidFinishLoading:(NSURLConnection *)connection
+-(void)installAsMockForClass:(Class)cls
 {
-    XCTAssertEqual(_callingThread, [NSThread currentThread], @"%@ not called on the calling thread", NSStringFromSelector(_cmd));
-    [_connectionFinishedExpectation fulfill];
+    if (_originalClientImplementation != nil) return;
+    
+    SEL selector = @selector(client);
+    Method method = class_getInstanceMethod(cls, selector);
+    _originalClientImplementation = (id<NSURLProtocolClient>(*)(id,SEL))method_getImplementation(method);
+    IMP newImpl = imp_implementationWithBlock(^id(id blockSelf) {
+        _realClient = _originalClientImplementation(blockSelf, selector);
+        return self;
+    });
+    if (!class_addMethod(cls, selector, newImpl, method_getTypeEncoding(method))) {
+        method_setImplementation(method, newImpl);
+    }
+}
+
+-(void)uninstallAsMockForClass:(Class)cls
+{
+    if (_originalClientImplementation == nil) return;
+    
+    SEL selector = @selector(client);
+    Method method = class_getInstanceMethod(cls, selector);
+    IMP mockImpl = method_getImplementation(method);
+    imp_removeBlock(mockImpl);
+    method_setImplementation(method, (IMP)_originalClientImplementation);
+    _originalClientImplementation = nil;
 }
 
 @end
+
+
+
