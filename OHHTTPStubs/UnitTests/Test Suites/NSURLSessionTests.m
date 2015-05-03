@@ -174,6 +174,46 @@
     }
 }
 
+- (void)test_NSURLSession_CustomHeaders
+{
+    if ([NSURLSessionConfiguration class] && [NSURLSession class])
+    {
+        static NSString* const kHeaderKey = @"X-PerSession-CustomHeader";
+        static NSString* const kHeaderValue = @"session-header";
+        
+        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+        config.HTTPAdditionalHeaders = @{ kHeaderKey: kHeaderValue };
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+        
+        [OHHTTPStubs stubRequestsPassingTest:^BOOL(NSURLRequest *request) {
+            XCTAssertEqualObjects(request.allHTTPHeaderFields[kHeaderKey], kHeaderValue,
+                                  @"Header configured at NSURLSession level not inserted");
+            return YES;
+        } withStubResponse:^OHHTTPStubsResponse *(NSURLRequest *request) {
+            return [OHHTTPStubsResponse responseWithJSONObject:@{@"result":@"ok"} statusCode:200 headers:nil];
+        }];
+        
+        
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"foo://custom-headers/"]];
+        [request setValue:@"request-header" forHTTPHeaderField:@"X-PerRequest-CustomHeader"];
+        
+        __block XCTestExpectation* expectation = [self expectationWithDescription:@"NSURLSessionDataTask completed"];
+        NSURLSessionDataTask *task =  [session dataTaskWithRequest:request
+                                                 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error)
+                                       {
+                                           [expectation fulfill];
+                                       }];
+        [task resume];
+        
+        [self waitForExpectationsWithTimeout:0.5 handler:nil];
+        expectation = nil;
+    }
+    else
+    {
+        NSLog(@"/!\\ Test skipped because the NSURLSession class is not available on this OS version. Run the tests a target with a more recent OS.\n");
+    }
+}
+
 - (void)test_NSURLSession_DataTask_DelegateMethods
 {
     if ([NSURLSessionConfiguration class] && [NSURLSession class])
