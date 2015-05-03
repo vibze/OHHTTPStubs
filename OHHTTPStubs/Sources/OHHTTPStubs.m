@@ -280,6 +280,12 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
     return ([OHHTTPStubs.sharedInstance firstStubPassingTestForRequest:request] != nil);
 }
 
++ (BOOL)canInitWithTask:(NSURLSessionTask *)task
+{
+    NSURLRequest* fixedRequest = [self addAdditionalHeadersToRequest:task.originalRequest forTask:task];
+    return [self canInitWithRequest:fixedRequest];
+}
+
 - (id)initWithRequest:(NSURLRequest *)request cachedResponse:(NSCachedURLResponse *)response client:(id<NSURLProtocolClient>)client
 {
     // Make super sure that we never use a cached response.
@@ -298,10 +304,45 @@ static NSTimeInterval const kSlotTime = 0.25; // Must be >0. We will send a chun
 	return nil;
 }
 
++ (NSURLRequest*)addAdditionalHeadersToRequest:(NSURLRequest*)request forTask:(NSURLSessionTask*)task
+{
+    if (!task) return request;
+    
+    // Don't add them twice
+    static NSString* const kAdditionalHeadersAddedKey = @"OHHTTPStubs-AdditionalHeaders-Added";
+    if ([OHHTTPStubsProtocol propertyForKey:kAdditionalHeadersAddedKey inRequest:request] != nil) return request;
+    
+    // Hack to access private instance variable that points to the NSURLSession until Apple provides a public method
+    NSURLSession* session = [task valueForKey:@"_localSession"];
+    if (![session isKindOfClass:[NSURLSession class]]) return request;
+    NSURLSessionConfiguration* config = session.configuration;
+    
+    NSURLRequest* newRequest = request;
+    if (config && config.HTTPAdditionalHeaders)
+    {
+        NSMutableURLRequest* mutRequest = [request mutableCopy];
+        NSDictionary* existingHeaders = mutRequest.allHTTPHeaderFields;
+        [config.HTTPAdditionalHeaders enumerateKeysAndObjectsUsingBlock:^(NSString* header, id value, BOOL *stop) {
+            // HTTPAdditionalheaders' doc says: «If the same header appears in both this array and
+            // the request object (where applicable), the request object’s value takes precedence.»
+            if (existingHeaders[header] == nil) {
+                [mutRequest setValue:value forHTTPHeaderField:header];
+            }
+        }];
+        [OHHTTPStubsProtocol setProperty:@YES forKey:kAdditionalHeadersAddedKey inRequest:mutRequest];
+        newRequest = [mutRequest copy];
+    }
+    return newRequest;
+}
+
 - (void)startLoading
 {
     self.clientRunLoop = CFRunLoopGetCurrent();
     NSURLRequest* request = self.request;
+    if ([self respondsToSelector:@selector(task)])
+    {
+        request = [OHHTTPStubsProtocol addAdditionalHeadersToRequest:request forTask:self.task];
+    }
     id<NSURLProtocolClient> client = self.client;
     
     if (!self.stub)
